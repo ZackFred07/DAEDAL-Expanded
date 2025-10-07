@@ -18,6 +18,7 @@ pip install -r requirements.txt
 pip install sacrebleu sqlitedict torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2
 
 # Get Checkpoints (Choose Which One You Need and Comment Out What You Don't)
+mkdir ckpts
 cd ckpts
 git lfs install
 git clone https://huggingface.co/GSAI-ML/LLaDA-8B-Instruct
