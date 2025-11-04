@@ -32,7 +32,7 @@ from transformers.models.auto import AutoModel
 from transformers.cache_utils import Cache
 
 from .configuration_diffullama import (
-    diffullamaConfig,
+    DiffuLLaMAConfig,
     StrEnum,
     InitFnType,
     ActivationType,
@@ -49,3 +49,41 @@ elif sys.version_info.minor == 8:
 else:
     raise SystemExit("This script supports Python 3.8 or higher")
 
+__all__ = [
+    "LayerNormBase",
+    "LayerNorm",
+    "RMSLayerNorm",
+    "GemmaRMSLayerNorm",
+    "RotaryEmbedding",
+    "Activation",
+    "GELU",
+    "ReLU",
+    "SwiGLU",
+]
+
+# modeling_diffullama.py
+from typing import Optional, Tuple, List, Union
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+from transformers import PreTrainedModel
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
+
+
+def _get_hidden_size(cfg):
+    return getattr(cfg, "hidden_size", getattr(cfg, "d_model", None))
+
+
+class DiffuLLaMAModelLM(PreTrainedModel):
+
+
+    config_class = DiffuLLaMAConfig
+    base_model_prefix = "model"
+
+
+AutoModel.register(DiffuLLaMAConfig, DiffuLLaMAModelLM)

@@ -403,7 +403,7 @@ class ActivationCheckpointingStrategy(StrEnum):
     """
     Checkpoint one in four transformer layers.
     """
-    
+
     two_in_three = "two_in_three"
     """
     Checkpoint two out of every three transformer layers.

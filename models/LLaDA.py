@@ -327,14 +327,14 @@ class LLaDA(TemplateLM):
             )
             self._rank = 0
             self._world_size = 1
-                
+
         self.custom_prefix_token_id = prefix_token_id
         if prefix_token_id is not None:
             eval_logger.info(
                 f"Loglikelihood prefix token id used in evaluation: {self.prefix_token_id}"
             )
         self.is_first_inference = True
-        
+
     @property
     def rank(self):
         if hasattr(self, "_rank"):
@@ -342,7 +342,7 @@ class LLaDA(TemplateLM):
         if hasattr(self, "accelerator"):
             return self.accelerator.local_process_index
         return int(os.environ.get("LOCAL_RANK", 0))
-    
+
     @property
     def world_size(self):
         if hasattr(self, "_world_size"):
@@ -350,7 +350,7 @@ class LLaDA(TemplateLM):
         if hasattr(self, "accelerator"):
             return self.accelerator.num_processes
         return int(os.environ.get("WORLD_SIZE", 1))
-    
+
     def _get_accelerate_args(
         self,
         parallelize: Optional[bool] = None,
@@ -616,7 +616,7 @@ class LLaDA(TemplateLM):
 
     def _loglikelihood_tokens(self, requests, **kwargs) -> List[Tuple[float, bool]]:
         raise NotImplementedError
-         
+
     def loglikelihood_rolling(
         self, requests: List[Instance], disable_tqdm: bool = False
     ) -> List[float]:
@@ -670,7 +670,7 @@ class LLaDA(TemplateLM):
                 bar.update(1)
         bar.close()
         return res
-     
+
     def apply_chat_template(
         self, chat_history: List[Dict[str, str]], add_generation_prompt: bool = True
     ) -> str:
