@@ -3,7 +3,9 @@ set -e
 
 
 BASE_OUTPUT_PATH="./results/baseline"
-MODEL_PATH="./ckpts/LLaDA-8B-Instruct"
+# good for Git Bash
+MODEL_PATH="$USERPROFILE/models/LLaDA-8B-Instruct"
+
 
 
 TASKS=("gsm8k" "math500")
