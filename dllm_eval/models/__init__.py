@@ -1,5 +1,6 @@
 from . import (
     huggingface,
+    llama,
 )
 from .configuration_llada import LLaDAConfig
 from .modeling_llada import LLaDAModelLM
