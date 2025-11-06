@@ -1,0 +1,12 @@
+task: svamp
+dataset_path: ChilleD/SVAMP
+output_type: generate_until
+test_split: test
+doc_to_text: !function utils.svamp_prompt
+doc_to_target: "{{Answer}}"
+generation_kwargs:
+  until:
+    - "[NO_UNTIL_PLACEHOLDER]"
+  do_sample: false
+repeats: 1
+num_fewshot: 0
