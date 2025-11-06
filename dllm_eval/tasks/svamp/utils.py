@@ -11,11 +11,10 @@ def svamp_prompt(doc):
       "</answer>"
   )
 
-  # Prefer the pre-concatenated field if present; otherwise join Body + Question.
   q = (
       doc.get("question_concat")
       or " ".join(x for x in [doc.get("Body"), doc.get("Question")] if x)
-      or doc.get("question")  # fallback for any alternative mirrors
+      or doc.get("question")
       or ""
   )
 
