@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --gres=gpu:nvidia_h100_pcie:2
 #SBATCH --account=course_cap6614
-#SBATCH --job-name="DAEDAL1p5Eval"
+#SBATCH --job-name="DAEDAL"
 
 # Original Repo Setup
 module load anaconda
