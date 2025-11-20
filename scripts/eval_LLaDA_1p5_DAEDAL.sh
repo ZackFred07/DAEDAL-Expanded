@@ -6,7 +6,7 @@ BASE_OUTPUT_PATH="./results/daedal_1p5"
 MODEL_PATH="./ckpts/LLaDA-1.5"
 
 
-TASKS=("gsm8k" "math500")
+TASKS=("gsm8k" "math500" "mmlu")
 LENGTHS=(64)
 for task in "${TASKS[@]}"; do
     for length in "${LENGTHS[@]}"; do
