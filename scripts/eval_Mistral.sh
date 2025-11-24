@@ -1,0 +1,63 @@
+#!/bin/bash
+set -e
+
+
+BASE_OUTPUT_PATH="./results/mistral"
+MODEL_PATH="./ckpts/Ministral-8B-Instruct-2410"
+
+
+TASKS=("gsm8k" "math500")
+LENGTHS=(64 128 256 512 1024)
+for task in "${TASKS[@]}"; do
+    for length in "${LENGTHS[@]}"; do
+        echo "======================================================"
+        echo "<<Baseline>> -> Task: ${task}, L_init: ${length}"
+        echo "======================================================"
+        OUTPUT_PATH="${BASE_OUTPUT_PATH}/${task}_${length}"
+
+        accelerate launch --config_file accelerate_config.yaml evaluation_script.py \
+            -m dllm_eval \
+            --model hf \
+            --tasks "${task}" \
+            --batch_size 4 \
+            --model_args "pretrained=mistralai/Ministral-8B-Instruct-2410 " \
+            --num_fewshot 0 \
+            --output_path "${OUTPUT_PATH}" \
+            --log_samples \
+            --apply_chat_template \
+            --fewshot_as_multiturn
+        
+        python metrics/${task}.py \
+            --model_path "${MODEL_PATH}" \
+            --res_path "${OUTPUT_PATH}"
+    done
+done
+
+
+TASKS=("humaneval" "mbpp")
+LENGTHS=(64 128 256 512 1024)
+for task in "${TASKS[@]}"; do
+    for length in "${LENGTHS[@]}"; do
+        echo "======================================================"
+        echo "<<Baseline>> -> Task: ${task}, L_init: ${length}"
+        echo "======================================================"
+        OUTPUT_PATH="${BASE_OUTPUT_PATH}/${task}_${length}"
+
+        accelerate launch --config_file accelerate_config.yaml evaluation_script.py \
+            -m dllm_eval \
+            --model hf \
+            --tasks "${task}" \
+            --batch_size 4 \
+            --model_args "pretrained=mistralai/Ministral-8B-Instruct-2410 " \
+            --num_fewshot 0 \
+            --output_path "${OUTPUT_PATH}" \
+            --log_samples \
+            --apply_chat_template \
+            --fewshot_as_multiturn \
+            --confirm_run_unsafe_code
+
+        python metrics/${task}.py \
+            --model_path "${MODEL_PATH}" \
+            --res_path "${OUTPUT_PATH}"
+    done
+done
