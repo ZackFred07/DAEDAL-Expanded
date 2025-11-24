@@ -19,7 +19,7 @@ for task in "${TASKS[@]}"; do
             -m dllm_eval \
             --model LLaDA \
             --tasks "${task}" \
-            --batch_size 2 \
+            --batch_size 4 \
             --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \
             --gen_kwargs "block_length=32,gen_length=${length},steps=${length},cfg_scale=0.0,remasking="low_confidence" " \
             --num_fewshot 0 \
@@ -48,7 +48,7 @@ for task in "${TASKS[@]}"; do
             -m dllm_eval \
             --model LLaDA \
             --tasks "${task}" \
-            --batch_size 2 \
+            --batch_size 4 \
             --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \
             --gen_kwargs "block_length=32,gen_length=${length},steps=${length},cfg_scale=0.0,remasking="low_confidence" " \
             --num_fewshot 0 \
