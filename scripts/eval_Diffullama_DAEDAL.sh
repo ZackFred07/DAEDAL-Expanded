@@ -17,7 +17,7 @@ for task in "${TASKS[@]}"; do
 
         accelerate launch --config_file accelerate_config.yaml evaluation_script.py \
             -m dllm_eval \
-            --model LLaDA_DAEDAL \
+            --model diffullama_DAEDAL \
             --tasks "${task}" \
             --batch_size 2 \
             --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \
@@ -46,7 +46,7 @@ for task in "${TASKS[@]}"; do
 
         accelerate launch --config_file accelerate_config.yaml evaluation_script.py \
             -m dllm_eval \
-            --model LLaDA_DAEDAL \
+            --model diffullama_DAEDAL \
             --tasks "${task}" \
             --batch_size 2 \
             --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \

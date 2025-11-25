@@ -41,10 +41,11 @@ def add_gumbel_noise(logits, temperature):
 
 def get_num_transfer_tokens(mask_index, steps):
     mask_num = mask_index.sum(dim=1, keepdim=True)
-    base = mask_num // steps
-    remainder = mask_num % steps
+    base = mask_num // steps # Perfectly even token count for each step
+    remainder = mask_num % steps # How many left over after that split
     num_transfer_tokens = base.expand(-1, steps).clone()
     if remainder.sum() > 0:
+        # Increase each step by 1 to account for the remaining tokens
         indices = torch.arange(steps, device=mask_index.device)
         mask = indices.unsqueeze(0) < remainder
         num_transfer_tokens[mask] += 1
@@ -54,7 +55,7 @@ def get_num_transfer_tokens(mask_index, steps):
 @torch.no_grad()
 def generate(
     model,
-    prompt,
+    prompt,  # (batch, prompt)
     tokenizer,
     steps=64,
     gen_length=128,
@@ -65,22 +66,38 @@ def generate(
     mask_id=126336,
 ):
     with torch.autocast(device_type="cuda"):
+
         x = torch.full(
             (prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long, device=prompt.device
-        )
+        ) # The full working sequence [prompt + generation_area]; shape: (batch_size, prompt_len + generation_length)
+
         x[:, : prompt.shape[1]] = prompt.clone()
+
+        # Prompt positions contain real tokens, after that they're
         prompt_index = x != mask_id
+
+        # generation region is split into num_blocks segments, each of length block length
         assert gen_length % block_length == 0
         num_blocks = gen_length // block_length
         steps_per_block = max(1, steps // num_blocks)
+
+        # For each block
         for num_block in tqdm(range(num_blocks), disable=(dist.is_available() and dist.is_initialized() and dist.get_rank() != 0)):
+
+            # Select the block regions that are still masked and return a tensor
             start_idx = prompt.shape[1] + num_block * block_length
             end_idx = prompt.shape[1] + (num_block + 1) * block_length
             block_mask_index = x[:, start_idx:end_idx] == mask_id
+
+            # num_transfer_tokens[j, i]: a Tensor that will be how many tokens to commit in `num_block` block for sample j at step i
+            # shape: (batch_size, steps_per_block); keep in mind were just focusing on the steps for this particular block
             num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
+
+            # Inner diffusion loop
             for i in range(steps_per_block):
-                mask_index = x == mask_id
+                mask_index = x == mask_id  # the global mask over all entire sequence
                 if cfg_scale > 0.0:
+                    # Use classifier free guidence; boosts directions where conditional `x` is different than unconditional `un_x`
                     un_x = x.clone()
                     un_x[prompt_index] = mask_id
                     x_ = torch.cat([x, un_x], dim=0)
@@ -88,22 +105,29 @@ def generate(
                     logits, un_logits = torch.chunk(logits, 2, dim=0)
                     logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
                 else:
+                    # Simply make a forward pass on the model
                     logits = model(x).logits
                 logits_with_noise = add_gumbel_noise(logits, temperature)
-                x0 = torch.argmax(logits_with_noise, dim=-1)
+                x0 = torch.argmax(logits_with_noise, dim=-1) # candidate token at each position
+
+                # Probability of the selected token is based on confidence
                 if remasking == "low_confidence":
                     p = F.softmax(logits, dim=-1)
                     x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
+                # Uniform random in [0,1] (tokens are chosen to be commited in a random order)
                 elif remasking == "random":
                     x0_p = torch.rand(x0.shape, device=x0.device)
                 else:
                     raise NotImplementedError(remasking)
-                x0_p[:, end_idx:] = -np.inf
-                x0 = torch.where(mask_index, x0, x)
-                confidence = torch.where(mask_index, x0_p, torch.tensor(-np.inf, device=x0.device))
+                x0_p[:, end_idx:] = -np.inf # Block any position after the current block from being chosens
+                x0 = torch.where(mask_index, x0, x) # Positions with mask keep predict x0, positions without mask filed with existing token in x; x0 being our candidate
+                confidence = torch.where(mask_index, x0_p, torch.tensor(-np.inf, device=x0.device)) # Confidence only only in mask posistions in this block
                 for j in range(confidence.shape[0]):
-                    num_tokens = num_transfer_tokens[j, i].item()
+                    num_tokens = num_transfer_tokens[
+                        j, i
+                    ].item()  # a Tensor that will be how many tokens to commit in `num_block` block for sample j at step i
                     if num_tokens > 0:
+                        # Get the number of tokens with the highest confidence abd write those tokens to x
                         _, select_indices = torch.topk(confidence[j], k=num_tokens)
                         x[j, select_indices] = x0[j, select_indices]
         return x

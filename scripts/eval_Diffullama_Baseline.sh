@@ -6,7 +6,7 @@ BASE_OUTPUT_PATH="./results/baseline_diffullama"
 MODEL_PATH="./ckpts/diffullama"
 
 TASKS=("gsm8k" "math500")
-LENGTHS=(32 64 128 256 512 1024)
+LENGTHS=( 64 128 256 512 1024)
 for task in "${TASKS[@]}"; do
     for length in "${LENGTHS[@]}"; do
         echo "======================================================"
@@ -16,7 +16,7 @@ for task in "${TASKS[@]}"; do
 
         accelerate launch --config_file accelerate_config.yaml evaluation_script.py \
             -m dllm_eval \
-            --model LLaDA \
+            --model diffullama \
             --tasks "${task}" \
             --batch_size 2 \
             --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \
@@ -35,7 +35,7 @@ done
 
 
 TASKS=("humaneval" "mbpp")
-LENGTHS=(32 64 128 256 512 1024 2048)
+LENGTHS=( 64 128 256 512 1024 )
 for task in "${TASKS[@]}"; do
     for length in "${LENGTHS[@]}"; do
         echo "======================================================"
@@ -45,7 +45,7 @@ for task in "${TASKS[@]}"; do
 
         accelerate launch --config_file accelerate_config.yaml evaluation_script.py \
             -m dllm_eval \
-            --model LLaDA \
+            --model diffullama \
             --tasks "${task}" \
             --batch_size 2 \
             --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \

@@ -7,7 +7,7 @@ MODEL_PATH="./ckpts/LLaDA-1.5"
 
 
 TASKS=("gsm8k" "math500")
-LENGTHS=(32 64 128 256 512 1024 2048)
+LENGTHS=(64 128 256 512 1024)
 for task in "${TASKS[@]}"; do
     for length in "${LENGTHS[@]}"; do
         echo "======================================================"
@@ -27,7 +27,7 @@ for task in "${TASKS[@]}"; do
             --log_samples \
             --apply_chat_template \
             --fewshot_as_multiturn
-        
+
         python metrics/${task}.py \
             --model_path "${MODEL_PATH}" \
             --res_path "${OUTPUT_PATH}"
@@ -36,7 +36,7 @@ done
 
 
 TASKS=("humaneval" "mbpp")
-LENGTHS=(32 64 128 256 512 1024 2048)
+LENGTHS=(32 64 128 256 512 1024)
 for task in "${TASKS[@]}"; do
     for length in "${LENGTHS[@]}"; do
         echo "======================================================"
