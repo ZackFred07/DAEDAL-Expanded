@@ -3,6 +3,9 @@ from . import (
 )
 from .configuration_llada import LLaDAConfig
 from .modeling_llada import LLaDAModelLM
+from .configuration_dream import DreamConfig
+from .modeling_dream import DreamModelLM
+
 try:
     # enable hf hub transfer if available
     import hf_transfer  # type: ignore # noqa
@@ -13,4 +16,4 @@ except ImportError:
     pass
 
 
-__all__ = ['LLaDAConfig', 'LLaDAModelLM']
+__all__ = ["LLaDAConfig", "LLaDAModelLM", "DreamConfig", "DreamModelLM"]
