@@ -1,4 +1,3 @@
-# metrics/mmlu.py
 
 import json
 import re
@@ -24,16 +23,13 @@ def extract_mmlu_letter_from_text(text: str) -> str | None:
     if text is None:
         return None
 
-    # 1) Prefer content inside <answer>...</answer>
     answer_block = extract_answer_block(text)
     search_space = answer_block if answer_block else text
 
-    # First: any standalone A/B/C/D in the answer block
     letters = re.findall(r"\b([ABCD])\b", search_space.upper())
     if letters:
-        return letters[-1]  # take the last one as the final answer
+        return letters[-1]
 
-    # 2) Look for "answer is X" / "answer: X" patterns
     patterns = re.findall(
         r"(?i)answer\s*(?:is|:)?\s*\(?([ABCD])\)?",
         search_space,
@@ -41,7 +37,6 @@ def extract_mmlu_letter_from_text(text: str) -> str | None:
     if patterns:
         return patterns[-1].upper()
 
-    # 3) As a final fallback, search the whole text for standalone A-D
     letters = re.findall(r"\b([ABCD])\b", text.upper())
     if letters:
         return letters[-1]
@@ -77,24 +72,31 @@ def parse_mmlu_answers_from_jsonl(json_path: str, tokenizer):
         total_processed += 1
 
         doc = item.get("doc", {})
-        # MMLU ground truth index 0-3 → letter A/B/C/D
         answer_idx = doc.get("answer", None)
         ground_truth_letter = None
-        if answer_idx is not None:
-            try:
-                ground_truth_letter = INDEX_TO_LETTER[int(answer_idx)]
-            except (ValueError, IndexError, TypeError):
-                ground_truth_letter = None
 
-        # Fallback: if for some reason doc['answer'] is missing,
-        # try to use item['target'] as a letter.
+        if answer_idx is not None:
+            if isinstance(answer_idx, str):
+                s = answer_idx.strip().upper()
+                if s in ("A", "B", "C", "D"):
+                    ground_truth_letter = s
+                else:
+                    try:
+                        ground_truth_letter = INDEX_TO_LETTER[int(s)]
+                    except (ValueError, IndexError):
+                        ground_truth_letter = None
+            else:
+                try:
+                    ground_truth_letter = INDEX_TO_LETTER[int(answer_idx)]
+                except (ValueError, IndexError, TypeError):
+                    ground_truth_letter = None
+
         if ground_truth_letter is None:
             target = str(item.get("target", "")).strip()
             last_char = target[-1:].upper()
             if last_char in INDEX_TO_LETTER:
                 ground_truth_letter = last_char
 
-        # Get model generation string
         raw_generation = ""
         resps = item.get("resps")
         if (
@@ -105,13 +107,11 @@ def parse_mmlu_answers_from_jsonl(json_path: str, tokenizer):
         ):
             raw_generation = resps[0][0]
 
-        # Count tokens
         total_raw_tokens = count_total_tokens(raw_generation, tokenizer)
         special_tokens = count_special_tokens(raw_generation)
         total_raw_tokens_sum += total_raw_tokens
         total_special_tokens_sum += special_tokens
 
-        # Extract predicted answer letter
         predicted_letter = extract_mmlu_letter_from_text(raw_generation)
 
         if (
@@ -132,7 +132,6 @@ def parse_mmlu_answers_from_jsonl(json_path: str, tokenizer):
 def evaluate_mmlu_results(directory: str, tokenizer_path: str):
     print("\n" + "=" * 50 + f"\nProcessing directory: {directory}\n" + "=" * 50)
 
-    # Load tokenizer from the model path (like your other metrics scripts)
     try:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     except Exception as e:
@@ -176,10 +175,8 @@ def evaluate_mmlu_results(directory: str, tokenizer_path: str):
         print("No valid data processed. Cannot calculate results.")
         return
 
-    # Accuracy
     accuracy = (agg["correct"] / total_processed) * 100.0
 
-    # Token stats
     total_raw_tokens = agg["total_raw_tokens"]
     total_special_tokens = agg["total_special_tokens"]
     avg_total_tokens = total_raw_tokens / total_processed if total_processed > 0 else 0.0
