@@ -7,7 +7,7 @@ MODEL_PATH="./ckpts/LLaDA-8B-Instruct"
 
 
 TASKS=("gsm8k" "math500")
-LENGTHS=(32 64 128 256 512 1024 2048)
+LENGTHS=(64 128 256 512 1024)
 for task in "${TASKS[@]}"; do
     for length in "${LENGTHS[@]}"; do
         echo "======================================================"
@@ -19,7 +19,7 @@ for task in "${TASKS[@]}"; do
             -m dllm_eval \
             --model LLaDA \
             --tasks "${task}" \
-            --batch_size 8 \
+            --batch_size 4 \
             --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \
             --gen_kwargs "block_length=32,gen_length=${length},steps=${length},cfg_scale=0.0,remasking="low_confidence" " \
             --num_fewshot 0 \
@@ -36,7 +36,7 @@ done
 
 
 TASKS=("humaneval" "mbpp")
-LENGTHS=(32 64 128 256 512 1024 2048)
+LENGTHS=(64 128 256 512 1024)
 for task in "${TASKS[@]}"; do
     for length in "${LENGTHS[@]}"; do
         echo "======================================================"
@@ -48,7 +48,7 @@ for task in "${TASKS[@]}"; do
             -m dllm_eval \
             --model LLaDA \
             --tasks "${task}" \
-            --batch_size 8 \
+            --batch_size 4 \
             --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \
             --gen_kwargs "block_length=32,gen_length=${length},steps=${length},cfg_scale=0.0,remasking="low_confidence" " \
             --num_fewshot 0 \

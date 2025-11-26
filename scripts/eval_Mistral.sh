@@ -2,8 +2,8 @@
 set -e
 
 
-BASE_OUTPUT_PATH="./results/baseline_1p5"
-MODEL_PATH="./ckpts/LLaDA-1.5"
+BASE_OUTPUT_PATH="./results/mistral"
+MODEL_PATH="./ckpts/Ministral-8B-Instruct-2410"
 
 
 TASKS=("gsm8k" "math500")
@@ -17,11 +17,10 @@ for task in "${TASKS[@]}"; do
 
         accelerate launch --config_file accelerate_config.yaml evaluation_script.py \
             -m dllm_eval \
-            --model LLaDA \
+            --model hf \
             --tasks "${task}" \
             --batch_size 4 \
-            --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \
-            --gen_kwargs "block_length=32,gen_length=${length},steps=${length},cfg_scale=0.0,remasking="low_confidence" " \
+            --model_args "pretrained=mistralai/Ministral-8B-Instruct-2410 " \
             --num_fewshot 0 \
             --output_path "${OUTPUT_PATH}" \
             --log_samples \
@@ -46,11 +45,10 @@ for task in "${TASKS[@]}"; do
 
         accelerate launch --config_file accelerate_config.yaml evaluation_script.py \
             -m dllm_eval \
-            --model LLaDA \
+            --model hf \
             --tasks "${task}" \
             --batch_size 4 \
-            --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \
-            --gen_kwargs "block_length=32,gen_length=${length},steps=${length},cfg_scale=0.0,remasking="low_confidence" " \
+            --model_args "pretrained=mistralai/Ministral-8B-Instruct-2410 " \
             --num_fewshot 0 \
             --output_path "${OUTPUT_PATH}" \
             --log_samples \
