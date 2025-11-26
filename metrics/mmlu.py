@@ -80,23 +80,11 @@ def parse_mmlu_answers_from_jsonl(json_path: str, tokenizer):
         # MMLU ground truth index 0-3 → letter A/B/C/D
         answer_idx = doc.get("answer", None)
         ground_truth_letter = None
-
         if answer_idx is not None:
-            # HF datasets often store ClassLabel as int (0-3), but be safe.
-            if isinstance(answer_idx, str):
-                s = answer_idx.strip().upper()
-                if s in ("A", "B", "C", "D"):
-                    ground_truth_letter = s
-                else:
-                    try:
-                        ground_truth_letter = INDEX_TO_LETTER[int(s)]
-                    except (ValueError, IndexError):
-                        ground_truth_letter = None
-            else:
-                try:
-                    ground_truth_letter = INDEX_TO_LETTER[int(answer_idx)]
-                except (ValueError, IndexError, TypeError):
-                    ground_truth_letter = None
+            try:
+                ground_truth_letter = INDEX_TO_LETTER[int(answer_idx)]
+            except (ValueError, IndexError, TypeError):
+                ground_truth_letter = None
 
         # Fallback: if for some reason doc['answer'] is missing,
         # try to use item['target'] as a letter.
