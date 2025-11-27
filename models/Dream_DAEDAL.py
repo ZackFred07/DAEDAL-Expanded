@@ -100,7 +100,7 @@ def generate(
     model,
     prompt,  # (batch, prompt)
     tokenizer,
-    attention_mask,,
+    attention_mask,
     initial_gen_length=64,
     max_gen_length=2048,
     temperature=0.0,
