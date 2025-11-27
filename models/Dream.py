@@ -117,97 +117,99 @@ def generate(
     top_k = None,
     num_return_sequences = 1
 ):
-    max_length = gen_length
+    with torch.autocast(device_type="cuda"):
 
-    assert prompt is not None
-    input_ids = prompt
-    device = input_ids.device
+        max_length = gen_length
 
-    input_ids_length = input_ids.shape[-1]
-    if (
-        not pad_token_id is None
-        and torch.any(input_ids == pad_token_id)
-        and attention_mask is None
-    ):
-        warnings.warn(
-            "Padding was detected but no attention mask is passed here. For correct "
-            "generation results, please set `attention_mask` when batch-padding inputs.",
-            UserWarning,
-        )
+        assert prompt is not None
+        input_ids = prompt
+        device = input_ids.device
 
-    histories = [] if (return_dict_in_generate and output_history) else None
+        input_ids_length = input_ids.shape[-1]
+        if (
+            not pad_token_id is None
+            and torch.any(input_ids == pad_token_id)
+            and attention_mask is None
+        ):
+            warnings.warn(
+                "Padding was detected but no attention mask is passed here. For correct "
+                "generation results, please set `attention_mask` when batch-padding inputs.",
+                UserWarning,
+            )
 
-    # pad input_ids to max_length
-    x = F.pad(input_ids, (0, max_length), value=mask_token_id)
+        histories = [] if (return_dict_in_generate and output_history) else None
 
-    if attention_mask is not None and torch.any(attention_mask == 0.0):
-        # we do not mask the [MASK] tokens so value = 1.0
-        attention_mask = F.pad(attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0)
-        tok_idx = attention_mask.long().cumsum(-1) - 1
-        tok_idx.masked_fill_(attention_mask == 0, 1)
-        # attention_mask is of shape [B, N]
-        # broadcast to [B, 1, N, N]
-        attention_mask = torch.logical_and(
-            attention_mask.unsqueeze(1).unsqueeze(-2),
-            attention_mask.unsqueeze(1).unsqueeze(-1),
-        )
-    else:
-        tok_idx = None
-        attention_mask = "full"
+        # pad input_ids to max_length
+        x = F.pad(input_ids, (0, max_length), value=mask_token_id)
 
-    timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
-
-    for i in range(steps):
-        mask_index = (x == mask_token_id)
-        logits = model(x, attention_mask, tok_idx).logits
-        logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
-
-        mask_logits = logits[mask_index]
-        t = timesteps[i]
-        s = timesteps[i + 1]
-
-        if alg == 'origin':
-            p_transfer = 1 - s / t if i < steps - 1 else 1
-            x0 = torch.zeros_like(x[mask_index], device=model.device, dtype=torch.long) + mask_token_id
-            transfer_index_t_s = torch.rand(*x0.shape, device=model.device) < p_transfer
-            _, x0[transfer_index_t_s]= sample_tokens(mask_logits[transfer_index_t_s], temperature=temperature, top_p=top_p, top_k=top_k)
-            x[mask_index] = x0.clone()
+        if attention_mask is not None and torch.any(attention_mask == 0.0):
+            # we do not mask the [MASK] tokens so value = 1.0
+            attention_mask = F.pad(attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0)
+            tok_idx = attention_mask.long().cumsum(-1) - 1
+            tok_idx.masked_fill_(attention_mask == 0, 1)
+            # attention_mask is of shape [B, N]
+            # broadcast to [B, 1, N, N]
+            attention_mask = torch.logical_and(
+                attention_mask.unsqueeze(1).unsqueeze(-2),
+                attention_mask.unsqueeze(1).unsqueeze(-1),
+            )
         else:
-            if alg == 'maskgit_plus':
-                confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
-            elif alg == 'topk_margin':
-                confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k, margin_confidence=True)
-            elif alg == 'entropy':
-                confidence, x0 = sample_tokens(mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True)
+            tok_idx = None
+            attention_mask = "full"
+
+        timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
+
+        for i in range(steps):
+            mask_index = (x == mask_token_id)
+            logits = model(x, attention_mask, tok_idx).logits
+            logits = torch.cat([logits[:,:1], logits[:, :-1]], dim=1)
+
+            mask_logits = logits[mask_index]
+            t = timesteps[i]
+            s = timesteps[i + 1]
+
+            if alg == 'origin':
+                p_transfer = 1 - s / t if i < steps - 1 else 1
+                x0 = torch.zeros_like(x[mask_index], device=model.device, dtype=torch.long) + mask_token_id
+                transfer_index_t_s = torch.rand(*x0.shape, device=model.device) < p_transfer
+                _, x0[transfer_index_t_s]= sample_tokens(mask_logits[transfer_index_t_s], temperature=temperature, top_p=top_p, top_k=top_k)
+                x[mask_index] = x0.clone()
             else:
-                raise RuntimeError(f"Unknown alg: {alg}")
-
-            num_mask_token = mask_index.sum() / mask_index.shape[0]
-            number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps - 1 else int(num_mask_token)
-            full_confidence = torch.full_like(x, -torch.inf, device=model.device, dtype=logits.dtype)
-            full_confidence[mask_index] = confidence
-            if number_transfer_tokens > 0:
-                if alg_temp is None or alg_temp == 0:
-                    _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)
+                if alg == 'maskgit_plus':
+                    confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k)
+                elif alg == 'topk_margin':
+                    confidence, x0 = sample_tokens(mask_logits, temperature=temperature, top_p=top_p, top_k=top_k, margin_confidence=True)
+                elif alg == 'entropy':
+                    confidence, x0 = sample_tokens(mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True)
                 else:
-                    full_confidence = full_confidence / alg_temp
-                    full_confidence = F.softmax(full_confidence, dim=-1)
-                    transfer_index = torch.multinomial(full_confidence, num_samples=number_transfer_tokens)
-                x_ = torch.zeros_like(x, device=model.device, dtype=torch.long) + mask_token_id
-                x_[mask_index] = x0.clone()
-                row_indices = torch.arange(x.size(0), device=model.device).unsqueeze(1).expand_as(transfer_index)
-                x[row_indices,transfer_index] = x_[row_indices,transfer_index]
+                    raise RuntimeError(f"Unknown alg: {alg}")
 
-        if histories is not None:
-            histories.append(x.clone())
+                num_mask_token = mask_index.sum() / mask_index.shape[0]
+                number_transfer_tokens = int(num_mask_token * (1 - s / t)) if i < steps - 1 else int(num_mask_token)
+                full_confidence = torch.full_like(x, -torch.inf, device=model.device, dtype=logits.dtype)
+                full_confidence[mask_index] = confidence
+                if number_transfer_tokens > 0:
+                    if alg_temp is None or alg_temp == 0:
+                        _, transfer_index = torch.topk(full_confidence, number_transfer_tokens)
+                    else:
+                        full_confidence = full_confidence / alg_temp
+                        full_confidence = F.softmax(full_confidence, dim=-1)
+                        transfer_index = torch.multinomial(full_confidence, num_samples=number_transfer_tokens)
+                    x_ = torch.zeros_like(x, device=model.device, dtype=torch.long) + mask_token_id
+                    x_[mask_index] = x0.clone()
+                    row_indices = torch.arange(x.size(0), device=model.device).unsqueeze(1).expand_as(transfer_index)
+                    x[row_indices,transfer_index] = x_[row_indices,transfer_index]
 
-    if return_dict_in_generate:
-        return DreamModelOutput(
-            sequences=x,
-            history=histories,
-        )
-    else:
-        return x
+            if histories is not None:
+                histories.append(x.clone())
+
+        if return_dict_in_generate:
+            return DreamModelOutput(
+                sequences=x,
+                history=histories,
+            )
+        else:
+            return x
 
 
 @register_model("Dream")
