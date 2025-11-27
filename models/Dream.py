@@ -119,12 +119,10 @@ def generate(
 ):
     max_length = gen_length
 
-    # 2. Define model inputs
     assert prompt is not None
     input_ids = prompt
     device = input_ids.device
 
-    # 3. Prepare `max_length`.
     input_ids_length = input_ids.shape[-1]
     if (
         not pad_token_id is None

@@ -4,7 +4,7 @@ from datetime import timedelta
 from typing import Dict, List, Literal, Optional, Tuple, Union, TypeVar
 import torch
 import torch.nn.functional as F
-import torch.distributed as dist
+import numpy as np
 import transformers
 from accelerate import (
     Accelerator,
@@ -14,6 +14,7 @@ from datasets import Dataset
 from accelerate.utils import get_max_memory
 from packaging import version
 from tqdm import tqdm
+import torch.distributed as dist
 from transformers.models.auto.modeling_auto import (
     MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
     MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING_NAMES,
@@ -29,30 +30,96 @@ eval_logger = logging.getLogger(__name__)
 T = TypeVar("T", bound="LM")
 
 
-def add_gumbel_noise(logits, temperature):
-    if temperature == 0.0:
-        return logits
-    logits = logits.to(torch.float32)
-    noise = torch.rand_like(logits, dtype=torch.float32)
-    gumbel_noise = (-torch.log(noise)) ** temperature
-    return logits.exp() / gumbel_noise
+def top_p_logits(logits, top_p=None):
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+    sorted_indices_to_remove = cumulative_probs > top_p
+    # Shift the indices to the right to keep the first token above the threshold
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = 0
+
+    mask = torch.zeros_like(logits, dtype=torch.bool, device=logits.device)
+    mask = mask.scatter_(-1, sorted_indices, sorted_indices_to_remove)
+    logits = logits.masked_fill(mask, torch.finfo(logits.dtype).min)
+    return logits
 
 
+def top_k_logits(logits, top_k=None):
+    top_k = min(top_k, logits.size(-1))  # Safety check
+    # Remove all tokens with a probability less than the last token of the top-k
+    indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+    logits = logits.masked_fill(indices_to_remove, torch.finfo(logits.dtype).min)
+    return logits
+
+
+def sample_tokens(
+    logits,
+    temperature=0.0,
+    top_p=None,
+    top_k=None,
+    margin_confidence=False,
+    neg_entropy=False,
+):
+
+    if temperature > 0:
+        logits = logits / temperature
+    if top_p is not None and top_p < 1:
+        logits = top_p_logits(logits, top_p)
+    if top_k is not None:
+        logits = top_k_logits(logits, top_k)
+    probs = torch.softmax(logits, dim=-1)
+
+    if temperature > 0:
+        try:
+            x0 = dists.Categorical(probs=probs).sample()
+            confidence = torch.gather(probs, -1, x0.unsqueeze(-1)).squeeze(-1)
+        except:
+            confidence, x0 = probs.max(dim=-1)
+    else:
+        confidence, x0 = probs.max(dim=-1)
+
+    if margin_confidence:
+        sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
+        # Extract top1 and top2 probabilities
+        top1_probs = sorted_probs[:, 0]
+        top2_probs = sorted_probs[:, 1]
+        # Calculate confidence as top1 - top2
+        confidence = top1_probs - top2_probs
+
+    if neg_entropy:
+        epsilon = 1e-10
+        log_probs = torch.log(probs + epsilon)
+        confidence = torch.sum(probs * log_probs, dim=-1)
+
+    return confidence, x0
+
+
+# Essentially replaces `generation_utils.DreamGenerationMixin` for the diffusion process
 @torch.no_grad()
 def generate(
     model,
-    prompt,
+    prompt,  # (batch, prompt)
     tokenizer,
+    attention_mask,
+    steps=64,
     initial_gen_length=64,
     max_gen_length=2048,
-    block_length=32,
     temperature=0.0,
-    cfg_scale=0.0,
     high_conf_threshold=0.90,
     low_conf_threshold=0.10,
     expansion_factor=8,
-    mask_id=126336,
-    eos_token_id=126081,
+    remasking="low_confidence",
+    mask_token_id=151666,
+    pad_token_id=151643,
+    eos_token_id=151643,
+    return_dict_in_generate=False,
+    output_history=False,
+    eps=1e-3,
+    alg="origin",
+    alg_temp=None,
+    top_p=None,
+    top_k=None,
+    num_return_sequences=1,
     eos_confidence_threshold=0.5,
     expand_eos_confidence_threshold=0.9,
     eos_check_tokens=32,
@@ -87,373 +154,417 @@ def generate(
 
         # A Batch vector of those average EOS confidences
         return torch.tensor(batch_eos_confidences, device=logits.device)
-
-    with torch.autocast(device_type="cuda"):
-        batch_size = prompt.shape[0]
-        device = prompt.device
-        prompt_length = prompt.shape[1]
-        assert eos_token_id is not None
-        gen_lengths = torch.full(
-            (batch_size,), initial_gen_length, dtype=torch.long, device=device
-        )
-        x = torch.full(
+    assert eos_token_id is not None
+    assert prompt is not None
+    batch_size = prompt.shape[0]
+    input_ids = prompt
+    device = input_ids.device
+    gen_lengths = torch.full((batch_size,), initial_gen_length, dtype=torch.long, device=device)
+    prompt_length = input_ids_length = input_ids.shape[-1]
+    x = torch.full(
             (batch_size, prompt_length + initial_gen_length),
-            mask_id,
+            mask_token_id,
             dtype=torch.long,
             device=device,
         )
-        x[:, :prompt_length] = prompt.clone()
-        prompt_index = x != mask_id
+    x[:, :prompt_length] = prompt.clone()
+    prompt_index = x != mask_token_id
 
+    if attention_mask is not None and torch.any(attention_mask == 0.0):
+        # we do not mask the [MASK] tokens so value = 1.0
+        attention_mask = F.pad(
+            attention_mask, (0, gen_lengths - attention_mask.shape[1]), value=1.0
+        )
+        tok_idx = attention_mask.long().cumsum(-1) - 1
+        tok_idx.masked_fill_(attention_mask == 0, 1)
+        # attention_mask is of shape [B, N]
+        # broadcast to [B, 1, N, N]
+        attention_mask = torch.logical_and(
+            attention_mask.unsqueeze(1).unsqueeze(-2),
+            attention_mask.unsqueeze(1).unsqueeze(-1),
+        )
+    else:
+        tok_idx = None
+        attention_mask = "full"
+
+    # TODO Stage 1
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
+        print("[Stage-1] Initial Length Adjustment")
+    while True:
+
+        total_lengths = prompt_length + gen_lengths
+        max_len_pre = x.shape[1]
+        # Build an attention mask up to total lengths
+        arange_tensor_pre = torch.arange(max_len_pre, device=device).expand(batch_size, -1)
+        attention_mask_pre = (arange_tensor_pre < total_lengths.unsqueeze(1)).long()
+        if attention_mask_pre is not None and torch.any(attention_mask_pre == 0.0):
+            print("That condition with the attention mask is actually true btw")
+        logits_pre = model(x, attention_mask="full").logits
+        # Compute EOS for each Sequence
+        batch_eos_confidences = _calculate_eos_confidence(logits_pre, total_lengths, prompt_length, eos_check_tokens)
+        # Decide which sequence need mroe space
+        sequences_to_expand = (batch_eos_confidences < eos_confidence_threshold) & (gen_lengths < max_gen_length)
+
+        if not sequences_to_expand.any():
+            # No sequence needs expansion
+            if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
+                print(f"All sequences' EOS confidence reach the threshold {eos_confidence_threshold} or max length.")
+            break
         if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
-            print("[Stage-1] Initial Length Adjustment")
-        while True:
+            print(f"Some sequences' EOS confidence ({[round(c.item(), 4) for c in batch_eos_confidences]}) < {eos_confidence_threshold}. Expand initial length.")
 
-            total_lengths = prompt_length + gen_lengths
-            max_len_pre = x.shape[1]
-            # Build an attention mask up to total lengths
-            arange_tensor_pre = torch.arange(max_len_pre, device=device).expand(
-                batch_size, -1
-            )
-            attention_mask_pre = (arange_tensor_pre < total_lengths.unsqueeze(1)).long()
-            logits_pre = model(x, attention_mask=attention_mask_pre).logits
-            # Compute EOS for each Sequence
-            batch_eos_confidences = _calculate_eos_confidence(
-                logits_pre, total_lengths, prompt_length, eos_check_tokens
-            )
-            # Decide which sequence need mroe space
-            sequences_to_expand = (batch_eos_confidences < eos_confidence_threshold) & (
-                gen_lengths < max_gen_length
-            )
+        # Increase their gen_lengths by expansion factor (capped by max_gen_length)
+        max_new_gen_len = gen_lengths[sequences_to_expand].max().item()
+        new_gen_lengths = gen_lengths.clone()
+        # Compute new generation length
+        new_gen_lengths[sequences_to_expand] = torch.clamp(gen_lengths[sequences_to_expand] + expansion_factor, max=max_gen_length)
+        if new_gen_lengths.max() <= gen_lengths.max():
+            # Check that max length is hit and break
+            if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
+                print(f"WARNING: Cannot expand initial length further (already at max length: {max_gen_length}).")
+            break
+        # Build the new tensor
+        max_new_total_len = prompt_length + new_gen_lengths.max()
+        new_x_tensor = torch.full((batch_size, max_new_total_len), eos_token_id, dtype=torch.long, device=device)
+        for i in range(batch_size):
+            # Copy the existing tokens into the front
+            original_total_len = prompt_length + gen_lengths[i].item()
+            new_x_tensor[i, :original_total_len] = x[i, :original_total_len]
+            if sequences_to_expand[i]:
+                # Where sequence was expanded, fill new positions with mask_id
+                new_total_len_i = prompt_length + new_gen_lengths[i].item()
+                new_x_tensor[i, original_total_len:new_total_len_i] = mask_token_id
+        # Update
+        x = new_x_tensor
+        gen_lengths = new_gen_lengths
 
-            if not sequences_to_expand.any():
-                # No sequence needs expansion
-                if (
-                    not (dist.is_available() and dist.is_initialized())
-                    or dist.get_rank() == 0
-                ):
-                    print(
-                        f"All sequences' EOS confidence reach the threshold {eos_confidence_threshold} or max length."
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
+        print(f"[Stage-2] Iterative Denoising and Mask Insertion")
+
+    current_pos = torch.full(
+        (batch_size,), prompt_length, dtype=torch.long, device=device
+    )  # The starting index into the generation region for all sequences
+    denoise_only_mode = torch.zeros(
+        batch_size, dtype=torch.bool, device=device
+    )  # Sequence is at max length, true if shouldn't expand
+
+    # While our current position hasnt ended
+    while (current_pos < prompt_length + gen_lengths).any():
+
+        total_lengths = prompt_length + gen_lengths
+        x_before_step = x.clone()
+
+        for i in range(batch_size):
+            if gen_lengths[i] >= max_gen_length and not denoise_only_mode[i]:
+                if current_pos[i] < total_lengths[i]:
+                    if (
+                        not (dist.is_available() and dist.is_initialized())
+                        or dist.get_rank() == 0
+                    ):
+                        print(
+                            f"Sequence {i} has reached the max length {max_gen_length}. Entering denoise-only mode."
+                        )
+                    denoise_only_mode[i] = True
+
+        max_len = x.shape[1]
+        arange_tensor = torch.arange(max_len, device=device).expand(batch_size, -1)
+        attention_mask = (arange_tensor < total_lengths.unsqueeze(1)).long()
+
+        # Forward pass
+        if attention_mask is not None and torch.any(attention_mask == 0.0):
+            print("That condition with the attention mask is actually true btw")
+        logits = model(x, "full", tok_idx).logits
+        logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
+        # mask_logits = logits[mask_index]
+
+        _, predicted_tokens = sample_tokens(
+            logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True
+        )
+        V = logits.size(-1)
+        confidences = F.softmax(logits, dim=-1)
+
+        predicted_confidences = torch.gather(
+            confidences, dim=-1, index=predicted_tokens.unsqueeze(-1)
+        ).squeeze(-1)
+
+
+        batch_eos_confidences = _calculate_eos_confidence(
+            logits, total_lengths, prompt_length, eos_check_tokens
+        )
+
+        currently_masked = (x == mask_token_id)
+
+        high_conf_indices = (
+            (predicted_confidences > high_conf_threshold)
+            & currently_masked
+            & (predicted_tokens != mask_token_id)
+        )
+
+        seq_len = x.size(1)
+        positions = torch.arange(seq_len, device=device)
+
+        for i in range(batch_size):
+            if current_pos[i] >= total_lengths[i]:
+                continue
+            start_idx, end_idx = current_pos[i], total_lengths[i].item()
+
+            if not high_conf_indices[i, start_idx:end_idx].any():
+                # Cibsuder all valid_fallback_mask
+                valid_fallback_mask = currently_masked[i]
+                if not valid_fallback_mask.any():
+                    continue
+                # Compute candidate confidences and tokens
+                candidate_indices = torch.where(valid_fallback_mask)[0]
+                candidate_confs = predicted_confidences[i, candidate_indices]
+                candidate_tokens = predicted_tokens[i, candidate_indices]
+
+                sorted_confs, sort_indices = torch.sort(
+                    candidate_confs, descending=True
+                )
+                best_idx_to_fill = -1
+                for sorted_idx in sort_indices:
+                    if candidate_tokens[sorted_idx] != mask_token_id:
+                        best_idx_to_fill = candidate_indices[sorted_idx]
+                        break
+                if best_idx_to_fill != -1:
+                    high_conf_indices[i, best_idx_to_fill] = True
+                else:
+                    stuck_logits = logits[i, candidate_indices]
+                    # Masked tokens set to negative infinity
+                    stuck_logits[:, mask_token_id] = -torch.inf
+                    new_confidences = F.softmax(stuck_logits, dim=-1)
+                    new_best_confs, new_best_tokens = torch.max(
+                        new_confidences, dim=-1
                     )
-                break
+
+                    # Pick the most confident non-mask token to be marked as high confidence (guarantee something gets denoised)
+                    best_of_the_best_local_idx = torch.argmax(new_best_confs)
+                    pos_to_fill = candidate_indices[best_of_the_best_local_idx]
+                    token_to_fill = new_best_tokens[best_of_the_best_local_idx]
+                    predicted_tokens[i, pos_to_fill] = token_to_fill
+                    high_conf_indices[i, pos_to_fill] = True
+
+        # Identify low confidence tokens to expands
+        potential_expand_mask = (
+            (predicted_confidences < low_conf_threshold)
+            & currently_masked
+            & (~high_conf_indices)
+        )
+        expand_indices = torch.zeros_like(x, dtype=torch.bool, device=device)
+        for i in range(batch_size):
+            if (
+                batch_eos_confidences[i] >= expand_eos_confidence_threshold
+                or gen_lengths[i] >= max_gen_length
+            ):
+                continue
+            if denoise_only_mode[i] or current_pos[i] >= total_lengths[i]:
+                continue
+
+            # Create expansion points
+            masked_candidates = torch.where(potential_expand_mask[i])[0]
+            if len(masked_candidates) > 0:
+
+                candidate_confs = predicted_confidences[i, masked_candidates]
+                num_to_expand = min(1, len(masked_candidates))
+                if num_to_expand > 0:
+                    _, lowest_conf_local_indices = torch.topk(
+                        candidate_confs, num_to_expand, largest=False
+                    )
+                    indices_to_expand_global = masked_candidates[
+                        lowest_conf_local_indices
+                    ]
+                    expand_indices[i, indices_to_expand_global] = True
+
+        # Apply fills
+        fill_mask = high_conf_indices
+        if not expand_indices.any():
+            x[fill_mask] = predicted_tokens[fill_mask]
+        else:
+            x[fill_mask] = predicted_tokens[fill_mask]
+
+            # Calculate how much to expand
+            max_new_total_len = 0
+            temp_new_gen_lengths = gen_lengths.clone()
+            for i in range(batch_size):
+                expansion_count = expand_indices[i].sum().item()
+                if expansion_count > 0:
+                    new_len = gen_lengths[i].item() + expansion_count * (
+                        expansion_factor - 1
+                    )
+                    temp_new_gen_lengths[i] = min(new_len, max_gen_length)
+
+            # Compute new max total length and allocate new_x_tensor filled with EOS
+            max_new_total_len = prompt_length + temp_new_gen_lengths.max()
+            new_x_tensor = torch.full(
+                (batch_size, max_new_total_len),
+                eos_token_id,
+                device=device,
+                dtype=torch.long,
+            )
+            new_gen_lengths = torch.zeros_like(gen_lengths)
+
+            for i in range(batch_size):
+                if not expand_indices[i].any():
+                    # Copy the old sequence as is
+                    total_len = prompt_length + gen_lengths[i].item()
+                    new_x_tensor[i, :total_len] = x[i, :total_len]
+                    new_gen_lengths[i] = gen_lengths[i]
+                    continue
+                write_ptr = prompt_length
+
+                new_x_tensor[i, :prompt_length] = x[
+                    i, :prompt_length
+                ]  # Copy prompt
+                # Iterate over old generation region
+                for j in range(
+                    prompt_length, prompt_length + gen_lengths[i].item()
+                ):
+                    if write_ptr >= max_new_total_len:
+                        break
+                    # If marked for expansion write the expansion otherwise continue
+                    if expand_indices[i, j]:
+                        end_write = min(
+                            write_ptr + expansion_factor, max_new_total_len
+                        )
+                        new_x_tensor[i, write_ptr:end_write] = mask_token_id
+                        write_ptr = end_write
+                    else:
+                        new_x_tensor[i, write_ptr] = x[i, j]
+                        write_ptr += 1
+
+                new_gen_lengths[i] = write_ptr - prompt_length
+            # Update
+            x = new_x_tensor
+            gen_lengths = new_gen_lengths
+
+        # State hasnt changed exit main loop
+        if torch.equal(x, x_before_step):
             if (
                 not (dist.is_available() and dist.is_initialized())
                 or dist.get_rank() == 0
             ):
                 print(
-                    f"Some sequences' EOS confidence ({[round(c.item(), 4) for c in batch_eos_confidences]}) < {eos_confidence_threshold}. Expand initial length."
+                    f"WARNING: Sequence state is stagnant, forcing generation to end."
                 )
+            break
 
-            # Increase their gen_lengths by expansion factor (capped by max_gen_length)
-            max_new_gen_len = gen_lengths[sequences_to_expand].max().item()
-            new_gen_lengths = gen_lengths.clone()
-            # Compute new generation length
-            new_gen_lengths[sequences_to_expand] = torch.clamp(
-                gen_lengths[sequences_to_expand] + expansion_factor, max=max_gen_length
-            )
-            if new_gen_lengths.max() <= gen_lengths.max():
-                # Check that max length is hit and break
-                if (
-                    not (dist.is_available() and dist.is_initialized())
-                    or dist.get_rank() == 0
-                ):
-                    print(
-                        f"WARNING: Cannot expand initial length further (already at max length: {max_gen_length})."
-                    )
-                break
-            # Build the new tensor
-            max_new_total_len = prompt_length + new_gen_lengths.max()
-            new_x_tensor = torch.full(
-                (batch_size, max_new_total_len),
-                eos_token_id,
-                dtype=torch.long,
-                device=device,
-            )
-            for i in range(batch_size):
-                # Copy the existing tokens into the front
-                original_total_len = prompt_length + gen_lengths[i].item()
-                new_x_tensor[i, :original_total_len] = x[i, :original_total_len]
-                if sequences_to_expand[i]:
-                    # Where sequence was expanded, fill new positions with mask_id
-                    new_total_len_i = prompt_length + new_gen_lengths[i].item()
-                    new_x_tensor[i, original_total_len:new_total_len_i] = mask_id
-            # Update
-            x = new_x_tensor
-            gen_lengths = new_gen_lengths
+    # Final output assembly
+    final_outputs = []
+    for i in range(batch_size):
+        final_len = prompt_length + gen_lengths[i]
+        final_outputs.append(x[i, :final_len])
+    return final_outputs
+    # # pad input_ids to max_length
+    # if attention_mask is not None and torch.any(attention_mask == 0.0):
+    #     # we do not mask the [MASK] tokens so value = 1.0
+    #     attention_mask = F.pad(
+    #         attention_mask, (0, max_length - attention_mask.shape[1]), value=1.0
+    #     )
+    #     tok_idx = attention_mask.long().cumsum(-1) - 1
+    #     tok_idx.masked_fill_(attention_mask == 0, 1)
+    #     # attention_mask is of shape [B, N]
+    #     # broadcast to [B, 1, N, N]
+    #     attention_mask = torch.logical_and(
+    #         attention_mask.unsqueeze(1).unsqueeze(-2),
+    #         attention_mask.unsqueeze(1).unsqueeze(-1),
+    #     )
+    # else:
+    #     tok_idx = None
+    #     attention_mask = "full"
 
-        # Extend each sequence's generation elgnth by half of eos_check_tokens capped by max_gen_length
-        new_gen_lengths_with_eos = gen_lengths + int(eos_check_tokens / 2)
-        new_gen_lengths_with_eos = torch.clamp(
-            new_gen_lengths_with_eos, max=max_gen_length
-        )
-        max_new_total_len = prompt_length + new_gen_lengths_with_eos.max()
-        intermediate_x_tensor = torch.full(
-            (batch_size, max_new_total_len),
-            eos_token_id,
-            dtype=torch.long,
-            device=device,
-        )
-        for i in range(batch_size):
-            # First gen_lengths[i] positions after the prompt are set to mask_id, rest is previously set eos_token_id
-            intermediate_x_tensor[i, :prompt_length] = x[i, :prompt_length]
-            intermediate_x_tensor[
-                i, prompt_length : prompt_length + gen_lengths[i].item()
-            ] = mask_id
-        x = intermediate_x_tensor
-        gen_lengths = new_gen_lengths_with_eos
+    # timesteps = torch.linspace(1, eps, steps + 1, device=x.device)
 
-        if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
-            print(f"[Stage-2] Iterative Denoising and Mask Insertion")
+    # for i in range(steps):
+    #     mask_index = x == mask_token_id
+    #     logits = model(x, attention_mask, tok_idx).logits
+    #     logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
 
-        current_pos = torch.full(
-            (batch_size,), prompt_length, dtype=torch.long, device=device
-        )  # The starting index into the generation region for all sequences
-        denoise_only_mode = torch.zeros(
-            batch_size, dtype=torch.bool, device=device
-        )  # Sequence is at max length, true if shouldn't expand
+    #     mask_logits = logits[mask_index]
+    #     t = timesteps[i]
+    #     s = timesteps[i + 1]
 
-        # While our current position hasnt ended
-        while (current_pos < prompt_length + gen_lengths).any():
+    #     if alg == "origin":
+    #         p_transfer = 1 - s / t if i < steps - 1 else 1
+    #         x0 = (
+    #             torch.zeros_like(x[mask_index], device=model.device, dtype=torch.long)
+    #             + mask_token_id
+    #         )
+    #         transfer_index_t_s = torch.rand(*x0.shape, device=model.device) < p_transfer
+    #         _, x0[transfer_index_t_s] = sample_tokens(
+    #             mask_logits[transfer_index_t_s],
+    #             temperature=temperature,
+    #             top_p=top_p,
+    #             top_k=top_k,
+    #         )
+    #         x[mask_index] = x0.clone()
+    #     else:
+    #         if alg == "maskgit_plus":
+    #             confidence, x0 = sample_tokens(
+    #                 mask_logits, temperature=temperature, top_p=top_p, top_k=top_k
+    #             )
+    #         elif alg == "topk_margin":
+    #             confidence, x0 = sample_tokens(
+    #                 mask_logits,
+    #                 temperature=temperature,
+    #                 top_p=top_p,
+    #                 top_k=top_k,
+    #                 margin_confidence=True,
+    #             )
+    #         elif alg == "entropy":
+    #             confidence, x0 = sample_tokens(
+    #                 mask_logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True
+    #             )
+    #         else:
+    #             raise RuntimeError(f"Unknown alg: {alg}")
 
-            total_lengths = prompt_length + gen_lengths
-            x_before_step = x.clone()
+    #         num_mask_token = mask_index.sum() / mask_index.shape[0]
+    #         number_transfer_tokens = (
+    #             int(num_mask_token * (1 - s / t))
+    #             if i < steps - 1
+    #             else int(num_mask_token)
+    #         )
+    #         full_confidence = torch.full_like(
+    #             x, -torch.inf, device=model.device, dtype=logits.dtype
+    #         )
+    #         full_confidence[mask_index] = confidence
+    #         if number_transfer_tokens > 0:
+    #             if alg_temp is None or alg_temp == 0:
+    #                 _, transfer_index = torch.topk(
+    #                     full_confidence, number_transfer_tokens
+    #                 )
+    #             else:
+    #                 full_confidence = full_confidence / alg_temp
+    #                 full_confidence = F.softmax(full_confidence, dim=-1)
+    #                 transfer_index = torch.multinomial(
+    #                     full_confidence, num_samples=number_transfer_tokens
+    #                 )
+    #             x_ = (
+    #                 torch.zeros_like(x, device=model.device, dtype=torch.long)
+    #                 + mask_token_id
+    #             )
+    #             x_[mask_index] = x0.clone()
+    #             row_indices = (
+    #                 torch.arange(x.size(0), device=model.device)
+    #                 .unsqueeze(1)
+    #                 .expand_as(transfer_index)
+    #             )
+    #             x[row_indices, transfer_index] = x_[row_indices, transfer_index]
 
-            for i in range(batch_size):
-                if gen_lengths[i] >= max_gen_length and not denoise_only_mode[i]:
-                    if current_pos[i] < total_lengths[i]:
-                        if (
-                            not (dist.is_available() and dist.is_initialized())
-                            or dist.get_rank() == 0
-                        ):
-                            print(
-                                f"Sequence {i} has reached the max length {max_gen_length}. Entering denoise-only mode."
-                            )
-                        denoise_only_mode[i] = True
+    #     if histories is not None:
+    #         histories.append(x.clone())
 
-            max_len = x.shape[1]
-            arange_tensor = torch.arange(max_len, device=device).expand(batch_size, -1)
-            attention_mask = (arange_tensor < total_lengths.unsqueeze(1)).long()
-
-            # Forward pass
-            if cfg_scale > 0.0:
-                un_x = x.clone()
-                un_x[prompt_index] = mask_id
-                un_attention_mask = attention_mask.clone()
-                x_ = torch.cat([x, un_x], dim=0)
-                attention_mask_ = torch.cat([attention_mask, un_attention_mask], dim=0)
-                logits, un_logits = torch.chunk(
-                    model(x_, attention_mask=attention_mask_).logits, 2, dim=0
-                )
-                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-            else:
-                logits = model(x, attention_mask=attention_mask).logits
-
-            # Get predictions, confidences, EOS confidence
-            predicted_tokens = torch.argmax(
-                add_gumbel_noise(logits, temperature), dim=-1
-            )
-            confidences = F.softmax(logits, dim=-1)
-            predicted_confidences = torch.gather(
-                confidences, dim=-1, index=predicted_tokens.unsqueeze(-1)
-            ).squeeze(-1)
-            batch_eos_confidences = _calculate_eos_confidence(
-                logits, total_lengths, prompt_length, eos_check_tokens
-            )
-
-            # Define the block being currently processed
-            block_mask = torch.zeros_like(x, dtype=torch.bool, device=device)
-            for i in range(batch_size):
-                if current_pos[i] >= total_lengths[i]:
-                    continue
-                block_mask[
-                    i,
-                    current_pos[i] : min(
-                        current_pos[i] + block_length, total_lengths[i].item()
-                    ),
-                ] = True
-
-            currently_masked = x == mask_id
-
-            # mask positions in the current block where the model is confident
-            high_conf_indices = (
-                (predicted_confidences > high_conf_threshold)
-                & block_mask
-                & currently_masked
-                & (predicted_tokens != mask_id)
-            )
-
-            for i in range(batch_size):
-                if current_pos[i] >= total_lengths[i]:
-                    continue
-                start_idx, end_idx = current_pos[i], min(
-                    current_pos[i] + block_length, total_lengths[i].item()
-                )
-
-                if not high_conf_indices[i, start_idx:end_idx].any():
-                    # Cibsuder all valid_fallback_mask
-                    valid_fallback_mask = block_mask[i] & currently_masked[i]
-                    if not valid_fallback_mask.any():
-                        continue
-                    # Compute candidate confidences and tokens
-                    candidate_indices = torch.where(valid_fallback_mask)[0]
-                    candidate_confs = predicted_confidences[i, candidate_indices]
-                    candidate_tokens = predicted_tokens[i, candidate_indices]
-
-                    sorted_confs, sort_indices = torch.sort(
-                        candidate_confs, descending=True
-                    )
-                    best_idx_to_fill = -1
-                    for sorted_idx in sort_indices:
-                        if candidate_tokens[sorted_idx] != mask_id:
-                            best_idx_to_fill = candidate_indices[sorted_idx]
-                            break
-                    if best_idx_to_fill != -1:
-                        high_conf_indices[i, best_idx_to_fill] = True
-                    else:
-                        stuck_logits = logits[i, candidate_indices]
-                        # Masked tokens set to negative infinity
-                        stuck_logits[:, mask_id] = -torch.inf
-                        new_confidences = F.softmax(stuck_logits, dim=-1)
-                        new_best_confs, new_best_tokens = torch.max(
-                            new_confidences, dim=-1
-                        )
-
-                        # Pick the most confident non-mask token to be marked as high confidence (guarantee something gets denoised)
-                        best_of_the_best_local_idx = torch.argmax(new_best_confs)
-                        pos_to_fill = candidate_indices[best_of_the_best_local_idx]
-                        token_to_fill = new_best_tokens[best_of_the_best_local_idx]
-                        predicted_tokens[i, pos_to_fill] = token_to_fill
-                        high_conf_indices[i, pos_to_fill] = True
-
-            # Identify low confidence tokens to expands
-            potential_expand_mask = (
-                (predicted_confidences < low_conf_threshold)
-                & block_mask
-                & currently_masked
-                & (~high_conf_indices)
-            )
-            expand_indices = torch.zeros_like(x, dtype=torch.bool, device=device)
-            for i in range(batch_size):
-                if (
-                    batch_eos_confidences[i] >= expand_eos_confidence_threshold
-                    or gen_lengths[i] >= max_gen_length
-                ):
-                    continue
-                if denoise_only_mode[i] or current_pos[i] >= total_lengths[i]:
-                    continue
-
-                # Create expansion points
-                masked_candidates = torch.where(potential_expand_mask[i])[0]
-                if len(masked_candidates) > 0:
-
-                    candidate_confs = predicted_confidences[i, masked_candidates]
-                    num_to_expand = min(1, len(masked_candidates))
-                    if num_to_expand > 0:
-                        _, lowest_conf_local_indices = torch.topk(
-                            candidate_confs, num_to_expand, largest=False
-                        )
-                        indices_to_expand_global = masked_candidates[
-                            lowest_conf_local_indices
-                        ]
-                        expand_indices[i, indices_to_expand_global] = True
-
-            # Apply fills
-            fill_mask = high_conf_indices
-            if not expand_indices.any():
-                x[fill_mask] = predicted_tokens[fill_mask]
-            else:
-                x[fill_mask] = predicted_tokens[fill_mask]
-
-                # Calculate how much to expand
-                max_new_total_len = 0
-                temp_new_gen_lengths = gen_lengths.clone()
-                for i in range(batch_size):
-                    expansion_count = expand_indices[i].sum().item()
-                    if expansion_count > 0:
-                        new_len = gen_lengths[i].item() + expansion_count * (
-                            expansion_factor - 1
-                        )
-                        temp_new_gen_lengths[i] = min(new_len, max_gen_length)
-
-                # Compute new max total length and allocate new_x_tensor filled with EOS
-                max_new_total_len = prompt_length + temp_new_gen_lengths.max()
-                new_x_tensor = torch.full(
-                    (batch_size, max_new_total_len),
-                    eos_token_id,
-                    device=device,
-                    dtype=torch.long,
-                )
-                new_gen_lengths = torch.zeros_like(gen_lengths)
-
-                for i in range(batch_size):
-                    if not expand_indices[i].any():
-                        # Copy the old sequence as is
-                        total_len = prompt_length + gen_lengths[i].item()
-                        new_x_tensor[i, :total_len] = x[i, :total_len]
-                        new_gen_lengths[i] = gen_lengths[i]
-                        continue
-                    write_ptr = prompt_length
-
-                    new_x_tensor[i, :prompt_length] = x[
-                        i, :prompt_length
-                    ]  # Copy prompt
-                    # Iterate over old generation region
-                    for j in range(
-                        prompt_length, prompt_length + gen_lengths[i].item()
-                    ):
-                        if write_ptr >= max_new_total_len:
-                            break
-                        # If marked for expansion write the expansion otherwise continue
-                        if expand_indices[i, j]:
-                            end_write = min(
-                                write_ptr + expansion_factor, max_new_total_len
-                            )
-                            new_x_tensor[i, write_ptr:end_write] = mask_id
-                            write_ptr = end_write
-                        else:
-                            new_x_tensor[i, write_ptr] = x[i, j]
-                            write_ptr += 1
-
-                    new_gen_lengths[i] = write_ptr - prompt_length
-                # Update
-                x = new_x_tensor
-                gen_lengths = new_gen_lengths
-
-            # Look at all the blocks, find one with a mask and set current position to that location
-            for i in range(batch_size):
-                total_len = prompt_length + gen_lengths[i]
-                while current_pos[i] < total_len:
-                    start_check = current_pos[i]
-                    end_check = min(start_check + block_length, total_len.item())
-                    if start_check == end_check:
-                        break
-                    if not (x[i, start_check:end_check] == mask_id).any():
-                        current_pos[i] = start_check + block_length
-                    else:
-                        break
-
-            # State hasnt changed exit main loop
-            if torch.equal(x, x_before_step):
-                if (
-                    not (dist.is_available() and dist.is_initialized())
-                    or dist.get_rank() == 0
-                ):
-                    print(
-                        f"WARNING: Sequence state is stagnant, forcing generation to end."
-                    )
-                break
-
-        # Final output assembly
-        final_outputs = []
-        for i in range(batch_size):
-            final_len = prompt_length + gen_lengths[i]
-            final_outputs.append(x[i, :final_len])
-        return final_outputs
+    # if return_dict_in_generate:
+    #     return DreamModelOutput(
+    #         sequences=x,
+    #         history=histories,
+    #     )
+    # else:
+    # return x
 
 
 @register_model("Dream_DAEDAL")
 class Dream_DAEDAL(TemplateLM):
-    AUTO_MODEL_CLASS = None
+    AUTO_MODEL_CLASS = transformers.AutoModel
     _DEFAULT_MAX_LENGTH = 20480
 
     def __init__(
@@ -491,7 +602,7 @@ class Dream_DAEDAL(TemplateLM):
         gptqmodel: Optional[bool] = False,
         gguf_file: Optional[str] = None,
         mc_num: int = 1024,
-        remasking: str = "expand",
+        remasking: str = "low_confidence",
         mask_id: int = 126336,
         is_check_greedy: bool = True,
         assistant_prefix: Optional[str] = None,
@@ -654,6 +765,7 @@ class Dream_DAEDAL(TemplateLM):
                             eval_logger.info(
                                 f"Using {gpus} devices with data parallelism"
                             )
+
                     self._device = torch.device(f"{self.accelerator.device}")
                     self._rank = self.accelerator.local_process_index
                     self._world_size = self.accelerator.num_processes
@@ -679,11 +791,19 @@ class Dream_DAEDAL(TemplateLM):
 
     @property
     def rank(self):
-        return self._rank
+        if hasattr(self, "_rank"):
+            return self._rank
+        if hasattr(self, "accelerator"):
+            return self.accelerator.local_process_index
+        return int(os.environ.get("LOCAL_RANK", 0))
 
     @property
     def world_size(self):
-        return self._world_size
+        if hasattr(self, "_world_size"):
+            return self._world_size
+        if hasattr(self, "accelerator"):
+            return self.accelerator.num_processes
+        return int(os.environ.get("WORLD_SIZE", 1))
 
     def _get_accelerate_args(
         self,
@@ -812,11 +932,6 @@ class Dream_DAEDAL(TemplateLM):
                     "HF model type is neither CausalLM nor Seq2SeqLM. Assuming CausalLM."
                 )
                 self.backend = "causal"
-        if self.AUTO_MODEL_CLASS is None:
-            if self.backend == "causal":
-                self.AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
-            elif self.backend == "seq2seq":
-                self.AUTO_MODEL_CLASS = transformers.AutoModelForSeq2SeqLM
 
     def _get_config(
         self,
@@ -835,7 +950,7 @@ class Dream_DAEDAL(TemplateLM):
         self,
         pretrained: str,
         revision: Optional[str] = "main",
-        dtype: Optional[Union[str, torch.dtype]] = "auto",
+        dtype: Optional[Union[str, torch.dtype]] = "bfloat",
         trust_remote_code: Optional[bool] = False,
         parallelize: Optional[bool] = False,
         gpus: Optional[int] = None,
@@ -849,27 +964,37 @@ class Dream_DAEDAL(TemplateLM):
         gguf_file: Optional[str] = None,
         **kwargs,
     ) -> None:
-        if autogptq or gptqmodel or peft or delta:
+        if autogptq or gptqmodel:
             raise NotImplementedError(
-                "Advanced model loading options are not implemented for this custom class."
+                "Quantization options are not implemented for this custom class."
             )
+        model_dtype = get_dtype(dtype)
+        eval_logger.info(f"Loading model with dtype: {model_dtype}")
         model_kwargs = kwargs if kwargs else {}
-        model_kwargs.update(
-            self._get_accelerate_args(
-                parallelize=parallelize,
-                gpus=gpus,
-                max_memory_per_gpu=max_memory_per_gpu,
-                max_cpu_memory=max_cpu_memory,
-                offload_folder=offload_folder,
+        if not parallelize:
+            model_kwargs.update(
+                self._get_accelerate_args(
+                    parallelize=parallelize,
+                    gpus=gpus,
+                    max_memory_per_gpu=max_memory_per_gpu,
+                    max_cpu_memory=max_cpu_memory,
+                    offload_folder=offload_folder,
+                )
             )
-        )
         self._model = DreamModelLM.from_pretrained(
             pretrained,
             revision=revision,
-            torch_dtype=get_dtype(dtype),
+            torch_dtype=model_dtype,
             trust_remote_code=trust_remote_code,
             **model_kwargs,
         )
+        if peft:
+            from peft import PeftModel
+
+            eval_logger.info(f"Loading PEFT model from {peft}")
+            self._model = PeftModel.from_pretrained(
+                self._model, peft, torch_dtype=model_dtype
+            )
         if not parallelize:
             self._model = self._model.to(self.device)
         self._model.eval()
@@ -995,8 +1120,6 @@ class Dream_DAEDAL(TemplateLM):
         gen_kwargs = requests[0].args[1]
         for batch in ds.iter(batch_size=int(self.batch_size)):
             contexts = batch["text"]
-            if self.add_bos_token:
-                contexts = [self.tokenizer.bos_token + p for p in contexts]
             context_enc, attn_masks = self.tok_batch_encode(
                 contexts,
                 truncation=self.truncation,
@@ -1006,23 +1129,18 @@ class Dream_DAEDAL(TemplateLM):
                 model=self.model,
                 prompt=context_enc,
                 tokenizer=self.tokenizer,
-                initial_gen_length=gen_kwargs.get("initial_gen_length", 64),
-                max_gen_length=gen_kwargs.get("max_gen_length", 2048),
-                block_length=gen_kwargs.get("block_length", 32),
+                attention_mask=attn_masks,
+                steps=gen_kwargs.get("steps", gen_kwargs.get("gen_length", 128)),
+                initial_gen_length=gen_kwargs.get("gen_length", 128),
+                max_gen_length=2048,
                 temperature=gen_kwargs.get("temperature", 0.0),
-                cfg_scale=gen_kwargs.get("cfg_scale", 0.0),
-                high_conf_threshold=gen_kwargs.get("high_conf_threshold", 0.90),
-                low_conf_threshold=gen_kwargs.get("low_conf_threshold", 0.10),
-                expansion_factor=gen_kwargs.get("expansion_factor", 8),
-                mask_id=self.mask_id,
-                eos_token_id=self.eot_token_id,
-                eos_confidence_threshold=gen_kwargs.get(
-                    "eos_confidence_threshold", 0.5
-                ),
-                expand_eos_confidence_threshold=gen_kwargs.get(
-                    "expand_eos_confidence_threshold", 0.9
-                ),
-                eos_check_tokens=gen_kwargs.get("eos_check_tokens", 32),
+                high_conf_threshold=0.90,
+                low_conf_threshold=0.10,
+                expansion_factor=8,
+                remasking=gen_kwargs.get("remasking", self.remasking),
+                mask_token_id=151666,
+                pad_token_id=151643,
+                eos_token_id=151643,
             )
             cont_toks_list = []
             for single_output in out_list:
