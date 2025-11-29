@@ -27,7 +27,7 @@ for task in "${TASKS[@]}"; do
             --log_samples \
             --apply_chat_template \
             --fewshot_as_multiturn
-        
+
         python metrics/${task}.py \
             --model_path "${MODEL_PATH}" \
             --res_path "${OUTPUT_PATH}"
@@ -57,7 +57,7 @@ for task in "${TASKS[@]}"; do
             --apply_chat_template \
             --fewshot_as_multiturn \
             --confirm_run_unsafe_code
-        
+
         python metrics/${task}.py \
             --model_path "${MODEL_PATH}" \
             --res_path "${OUTPUT_PATH}"

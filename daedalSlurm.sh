@@ -24,7 +24,6 @@ git lfs install
 # git clone https://huggingface.co/GSAI-ML/LLaDA-8B-Instruct
 # git clone https://huggingface.co/GSAI-ML/LLaDA-1.5
 git clone https://huggingface.co/Dream-org/Dream-v0-Instruct-7B
-git clone
 cd ..
 
 # Run Evaluation (Choose Which One You Need and Comment Out What You Don't)

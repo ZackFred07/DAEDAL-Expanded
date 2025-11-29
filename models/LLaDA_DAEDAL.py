@@ -285,7 +285,6 @@ def generate(
                 new_x_tensor = torch.full((batch_size, max_new_total_len), eos_token_id, device=device, dtype=torch.long)
                 new_gen_lengths = torch.zeros_like(gen_lengths)
 
-
                 for i in range(batch_size):
                     if not expand_indices[i].any():
                         # Copy the old sequence as is
@@ -312,7 +311,6 @@ def generate(
                 # Update
                 x = new_x_tensor
                 gen_lengths = new_gen_lengths
-
 
             # Look at all the blocks, find one with a mask and set current position to that location
             for i in range(batch_size):

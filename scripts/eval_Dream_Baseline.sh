@@ -3,7 +3,7 @@ set -e
 
 
 BASE_OUTPUT_PATH="./results/baseline"
-MODEL_PATH="./ckpts/Dream-8B-Instruct"
+MODEL_PATH="./ckpts/Dream-v0-Instruct-7B"
 
 
 TASKS=("gsm8k" "math500")
@@ -19,7 +19,7 @@ for task in "${TASKS[@]}"; do
             -m dllm_eval \
             --model Dream \
             --tasks "${task}" \
-            --batch_size 2 \
+            --batch_size 1 \
             --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \
             --gen_kwargs "block_length=32,gen_length=${length},steps=${length},cfg_scale=0.0,remasking="low_confidence" " \
             --num_fewshot 0 \

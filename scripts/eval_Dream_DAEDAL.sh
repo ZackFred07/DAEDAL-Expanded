@@ -3,7 +3,7 @@ set -e
 
 
 BASE_OUTPUT_PATH="./results/daedal"
-MODEL_PATH="./ckpts/Dream-8B-Instruct"
+MODEL_PATH="./ckpts/Dream-v0-Instruct-7B"
 
 
 TASKS=("gsm8k" "math500")
@@ -19,7 +19,7 @@ for task in "${TASKS[@]}"; do
             -m dllm_eval \
             --model Dream_DAEDAL \
             --tasks "${task}" \
-            --batch_size 2 \
+            --batch_size 1 \
             --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \
             --gen_kwargs "block_length=32,initial_gen_length=${length},max_gen_length=2048,cfg_scale=0.0,high_conf_threshold=0.9,low_conf_threshold=0.1,eos_confidence_threshold=0.5,expand_eos_confidence_threshold=0.9,expansion_factor=8,eos_check_tokens=32 "  \
             --num_fewshot 0  \
@@ -48,7 +48,7 @@ for task in "${TASKS[@]}"; do
             -m dllm_eval \
             --model Dream_DAEDAL \
             --tasks "${task}" \
-            --batch_size 2 \
+            --batch_size 1 \
             --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \
             --gen_kwargs "block_length=32,initial_gen_length=${length},max_gen_length=2048,cfg_scale=0.0,high_conf_threshold=0.9,low_conf_threshold=0.1,eos_confidence_threshold=0.5,expand_eos_confidence_threshold=0.9,expansion_factor=8,eos_check_tokens=32 "  \
             --num_fewshot 0  \

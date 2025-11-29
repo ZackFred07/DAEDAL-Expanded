@@ -121,6 +121,7 @@ def generate(
     eos_confidence_threshold=0.5,
     expand_eos_confidence_threshold=0.9,
     eos_check_tokens=32,
+    block_length=32,
 ):
     with torch.autocast(device_type="cuda"):
         # Helper function to calculate EOS confidence
@@ -279,13 +280,22 @@ def generate(
             _, predicted_tokens = sample_tokens(
                 logits, temperature, top_p=top_p, top_k=top_k, neg_entropy=True
             )
-            V = logits.size(-1)
             confidences = F.softmax(logits, dim=-1)
 
             predicted_confidences = torch.gather(
                 confidences, dim=-1, index=predicted_tokens.unsqueeze(-1)
             ).squeeze(-1)
 
+            block_mask = torch.zeros_like(x, dtype=torch.bool, device=device)
+            for i in range(batch_size):
+                if current_pos[i] >= total_lengths[i]:
+                    continue
+                block_mask[
+                    i,
+                    current_pos[i] : min(
+                        current_pos[i] + block_length, total_lengths[i].item()
+                    ),
+                ] = True
 
             batch_eos_confidences = _calculate_eos_confidence(
                 logits, total_lengths, prompt_length, eos_check_tokens
@@ -295,6 +305,7 @@ def generate(
 
             high_conf_indices = (
                 (predicted_confidences > high_conf_threshold)
+                & block_mask
                 & currently_masked
                 & (predicted_tokens != mask_token_id)
             )
@@ -305,11 +316,13 @@ def generate(
             for i in range(batch_size):
                 if current_pos[i] >= total_lengths[i]:
                     continue
-                start_idx, end_idx = current_pos[i], total_lengths[i].item()
+                start_idx, end_idx = current_pos[i], min(
+                    current_pos[i] + block_length, total_lengths[i].item()
+                )
 
                 if not high_conf_indices[i, start_idx:end_idx].any():
                     # Cibsuder all valid_fallback_mask
-                    valid_fallback_mask = currently_masked[i]
+                    valid_fallback_mask = block_mask[i] & currently_masked[i]
                     if not valid_fallback_mask.any():
                         continue
                     # Compute candidate confidences and tokens
@@ -346,7 +359,7 @@ def generate(
             # Identify low confidence tokens to expands
             potential_expand_mask = (
                 (predicted_confidences < low_conf_threshold)
-                & currently_masked
+                & currently_masked & block_mask
                 & (~high_conf_indices)
             )
             expand_indices = torch.zeros_like(x, dtype=torch.bool, device=device)
@@ -436,6 +449,18 @@ def generate(
                 x = new_x_tensor
                 gen_lengths = new_gen_lengths
 
+            # Look at all the blocks, find one with a mask and set current position to that location
+            for i in range(batch_size):
+                total_len = prompt_length + gen_lengths[i]
+                while current_pos[i] < total_len:
+                    start_check = current_pos[i]
+                    end_check = min(start_check + block_length, total_len.item())
+                    if start_check == end_check:
+                        break
+                    if not (x[i, start_check:end_check] == mask_token_id).any():
+                        current_pos[i] = start_check + block_length
+                    else:
+                        break
             # State hasnt changed exit main loop
             if torch.equal(x, x_before_step):
                 if (
