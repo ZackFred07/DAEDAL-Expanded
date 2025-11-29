@@ -6,7 +6,8 @@ BASE_OUTPUT_PATH="./results/baseline"
 MODEL_PATH="./ckpts/Dream-v0-Instruct-7B"
 
 
-TASKS=("gsm8k" "math500")
+# TASKS=("gsm8k" "math500" "svamp")
+TASKS=("svamp")
 LENGTHS=(64 128 256 512 1024)
 for task in "${TASKS[@]}"; do
     for length in "${LENGTHS[@]}"; do

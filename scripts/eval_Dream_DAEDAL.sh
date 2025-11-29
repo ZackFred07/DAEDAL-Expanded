@@ -6,7 +6,7 @@ BASE_OUTPUT_PATH="./results/daedal"
 MODEL_PATH="./ckpts/Dream-v0-Instruct-7B"
 
 
-TASKS=("gsm8k" "math500")
+TASKS=("gsm8k" "math500" "svamp")
 LENGTHS=(64)
 for task in "${TASKS[@]}"; do
     for length in "${LENGTHS[@]}"; do
