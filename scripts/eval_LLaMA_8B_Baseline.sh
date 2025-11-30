@@ -8,7 +8,7 @@ BASE_OUTPUT_PATH="./results/llama_baseline"
 MODEL_NAME="meta-llama/Meta-Llama-3-8B-Instruct"
 
 # Tasks
-TASKS_GSM_MATH=("gsm8k" "math500")
+TASKS_GSM_MATH=("gsm8k" "math500" "svamp" "mmlu")
 TASKS_CODE=("humaneval" "mbpp")
 
 # Generation lengths
