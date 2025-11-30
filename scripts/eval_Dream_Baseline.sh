@@ -6,8 +6,8 @@ BASE_OUTPUT_PATH="./results/baseline"
 MODEL_PATH="./ckpts/Dream-v0-Instruct-7B"
 
 
-# TASKS=("gsm8k" "math500" "svamp")
-TASKS=("svamp")
+# TASKS=("gsm8k" "math500" "svamp" "mmlu")
+TASKS=("svamp" "mmlu")
 LENGTHS=(64 128 256 512 1024)
 for task in "${TASKS[@]}"; do
     for length in "${LENGTHS[@]}"; do
@@ -36,31 +36,31 @@ for task in "${TASKS[@]}"; do
 done
 
 
-TASKS=("humaneval" "mbpp")
-LENGTHS=(32 64 128 256 512 1024)
-for task in "${TASKS[@]}"; do
-    for length in "${LENGTHS[@]}"; do
-        echo "======================================================"
-        echo "<<Baseline>> -> Task: ${task}, L_init: ${length}"
-        echo "======================================================"
-        OUTPUT_PATH="${BASE_OUTPUT_PATH}/${task}_${length}"
+# TASKS=("humaneval" "mbpp")
+# LENGTHS=(32 64 128 256 512 1024)
+# for task in "${TASKS[@]}"; do
+#     for length in "${LENGTHS[@]}"; do
+#         echo "======================================================"
+#         echo "<<Baseline>> -> Task: ${task}, L_init: ${length}"
+#         echo "======================================================"
+#         OUTPUT_PATH="${BASE_OUTPUT_PATH}/${task}_${length}"
 
-        accelerate launch --config_file accelerate_config.yaml evaluation_script.py \
-            -m dllm_eval \
-            --model Dream \
-            --tasks "${task}" \
-            --batch_size 2 \
-            --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \
-            --gen_kwargs "block_length=32,gen_length=${length},steps=${length},cfg_scale=0.0,remasking="low_confidence" " \
-            --num_fewshot 0 \
-            --output_path "${OUTPUT_PATH}" \
-            --log_samples \
-            --apply_chat_template \
-            --fewshot_as_multiturn \
-            --confirm_run_unsafe_code
+#         accelerate launch --config_file accelerate_config.yaml evaluation_script.py \
+#             -m dllm_eval \
+#             --model Dream \
+#             --tasks "${task}" \
+#             --batch_size 2 \
+#             --model_args "pretrained=${MODEL_PATH},assistant_prefix=<reasoning> " \
+#             --gen_kwargs "block_length=32,gen_length=${length},steps=${length},cfg_scale=0.0,remasking="low_confidence" " \
+#             --num_fewshot 0 \
+#             --output_path "${OUTPUT_PATH}" \
+#             --log_samples \
+#             --apply_chat_template \
+#             --fewshot_as_multiturn \
+#             --confirm_run_unsafe_code
 
-        python metrics/${task}.py \
-            --model_path "${MODEL_PATH}" \
-            --res_path "${OUTPUT_PATH}"
-    done
-done
+#         python metrics/${task}.py \
+#             --model_path "${MODEL_PATH}" \
+#             --res_path "${OUTPUT_PATH}"
+#     done
+# done
