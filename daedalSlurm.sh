@@ -31,3 +31,4 @@ sh scripts/eval_LLaDA_1p5_Baseline.sh
 sh scripts/eval_LLaDA_DAEDAL.sh
 sh scripts/eval_LLaDA_Baseline.sh
 sh scripts/eval_LLaMA_8B_Baseline.sh
+sh scripts/eval_LLaDA_Baseline.sh
