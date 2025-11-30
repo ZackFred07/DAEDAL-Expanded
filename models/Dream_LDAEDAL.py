@@ -101,7 +101,7 @@ def generate(
     prompt,  # (batch, prompt)
     tokenizer,
     attention_mask,
-    initial_gen_length=64,
+    min_gen_length=64,
     max_gen_length=2048,
     temperature=0.0,
     high_conf_threshold=0.90,
@@ -123,42 +123,52 @@ def generate(
     eos_check_tokens=32,
     block_length=32,
 ):
+    def _calculate_eos_confidence(
+    # Helper function to calculate EOS confidence
+        logits, total_lengths, prompt_length, eos_check_tokens
+    ):
+        if eos_token_id is None:
+            return torch.zeros(logits.shape[0], device=logits.device)
+
+        # Convert Logits to probabilities
+        confidences = F.softmax(logits, dim=-1)
+        predicted_tokens = torch.argmax(logits, dim=-1)
+
+        batch_eos_confidences = []
+        for i in range(logits.shape[0]):
+            # Go through each batch from total_lengths [i] to prompt_length -1
+            eos_confs_for_avg = []
+            start_scan_pos = total_lengths[i].item() - 1
+            end_scan_pos = prompt_length - 1
+
+            for pos in range(start_scan_pos, end_scan_pos, -1):
+                # Collect up to eos_check_tokens positions where predicted_tokens[i,pos] == eos_token_id
+                if len(eos_confs_for_avg) >= eos_check_tokens:
+                    break
+                # Record the EOS probability
+                if predicted_tokens[i, pos] == eos_token_id:
+                    eos_confs_for_avg.append(confidences[i, pos, eos_token_id].item())
+            avg_conf = sum(eos_confs_for_avg) / eos_check_tokens
+            batch_eos_confidences.append(avg_conf)
+
+        # A Batch vector of those average EOS confidences
+        return torch.tensor(batch_eos_confidences, device=logits.device)
+
     with torch.autocast(device_type="cuda"):
-        # Helper function to calculate EOS confidence
-        def _calculate_eos_confidence(
-            logits, total_lengths, prompt_length, eos_check_tokens
-        ):
-            if eos_token_id is None:
-                return torch.zeros(logits.shape[0], device=logits.device)
-
-            # Convert Logits to probabilities
-            confidences = F.softmax(logits, dim=-1)
-            predicted_tokens = torch.argmax(logits, dim=-1)
-
-            batch_eos_confidences = []
-            for i in range(logits.shape[0]):
-                # Go through each batch from total_lengths [i] to prompt_length -1
-                eos_confs_for_avg = []
-                start_scan_pos = total_lengths[i].item() - 1
-                end_scan_pos = prompt_length - 1
-
-                for pos in range(start_scan_pos, end_scan_pos, -1):
-                    # Collect up to eos_check_tokens positions where predicted_tokens[i,pos] == eos_token_id
-                    if len(eos_confs_for_avg) >= eos_check_tokens:
-                        break
-                    # Record the EOS probability
-                    if predicted_tokens[i, pos] == eos_token_id:
-                        eos_confs_for_avg.append(confidences[i, pos, eos_token_id].item())
-                avg_conf = sum(eos_confs_for_avg) / eos_check_tokens
-                batch_eos_confidences.append(avg_conf)
-
-            # A Batch vector of those average EOS confidences
-            return torch.tensor(batch_eos_confidences, device=logits.device)
         assert eos_token_id is not None
         assert prompt is not None
         batch_size = prompt.shape[0]
         input_ids = prompt
         device = input_ids.device
+        initial_gen_length = min_gen_length + (max_gen_length - min_gen_length) // 2
+        floor_gen_lengths = torch.full(
+            (batch_size,), min_gen_length, dtype=torch.long, device=device
+        )
+        ceiling_gen_lengths = torch.full(
+            (batch_size,), max_gen_length, dtype=torch.long, device=device
+        )
+        min_eos = eos_confidence_threshold
+        max_eos = eos_confidence_threshold + 0.05
         gen_lengths = torch.full((batch_size,), initial_gen_length, dtype=torch.long, device=device)
         prompt_length = input_ids_length = input_ids.shape[-1]
         x = torch.full(
@@ -203,36 +213,58 @@ def generate(
             # Compute EOS for each Sequence
             batch_eos_confidences = _calculate_eos_confidence(logits_pre, total_lengths, prompt_length, eos_check_tokens)
             # Decide which sequence need mroe space
-            sequences_to_expand = (batch_eos_confidences < eos_confidence_threshold) & (gen_lengths < max_gen_length)
+            sequences_to_increase = min_eos >= batch_eos_confidences
+            sequences_to_decrease = max_eos <= batch_eos_confidences
+            sequences_to_search = sequences_to_increase | sequences_to_decrease
+            if (floor_gen_lengths == ceiling_gen_lengths).any():
+                print("floor & ceiling equaled")
+            sequences_to_search = (
+                ~(floor_gen_lengths == ceiling_gen_lengths) & sequences_to_search
+            )
 
-            if not sequences_to_expand.any():
-                # No sequence needs expansion
+            if not sequences_to_search.any():
+                # No sequence needs further searching
                 if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
                     print(f"All sequences' EOS confidence reach the threshold {eos_confidence_threshold} or max length.")
                 break
             if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
                 print(f"Some sequences' EOS confidence ({[round(c.item(), 4) for c in batch_eos_confidences]}) < {eos_confidence_threshold}. Expand initial length.")
 
-            # Increase their gen_lengths by expansion factor (capped by max_gen_length)
-            max_new_gen_len = gen_lengths[sequences_to_expand].max().item()
+            # Binear Search
             new_gen_lengths = gen_lengths.clone()
-            # Compute new generation length
-            new_gen_lengths[sequences_to_expand] = torch.clamp(gen_lengths[sequences_to_expand] + expansion_factor, max=max_gen_length)
-            if new_gen_lengths.max() <= gen_lengths.max():
-                # Check that max length is hit and break
-                if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
-                    print(f"WARNING: Cannot expand initial length further (already at max length: {max_gen_length}).")
-                break
+            floor_gen_lengths[sequences_to_increase] = new_gen_lengths[
+                sequences_to_increase
+            ]
+            ceiling_gen_lengths[sequences_to_decrease] = new_gen_lengths[
+                sequences_to_decrease
+            ]
+
+            new_gen_lengths[sequences_to_search] = floor_gen_lengths[
+                sequences_to_search
+            ] + torch.bitwise_right_shift(
+                ceiling_gen_lengths[sequences_to_search]
+                - floor_gen_lengths[sequences_to_search],
+                1,
+            )
+
             # Build the new tensor
             max_new_total_len = prompt_length + new_gen_lengths.max()
-            new_x_tensor = torch.full((batch_size, max_new_total_len), eos_token_id, dtype=torch.long, device=device)
+            new_x_tensor = torch.full(
+                (batch_size, max_new_total_len),
+                eos_token_id,
+                dtype=torch.long,
+                device=device,
+            )
             for i in range(batch_size):
                 # Copy the existing tokens into the front
-                original_total_len = prompt_length + gen_lengths[i].item()
+                original_total_len = min(
+                    prompt_length + gen_lengths[i].item(),
+                    prompt_length + new_gen_lengths[i].item(),
+                )
                 new_x_tensor[i, :original_total_len] = x[i, :original_total_len]
-                if sequences_to_expand[i]:
+                new_total_len_i = prompt_length + new_gen_lengths[i].item()
+                if sequences_to_search[i] and new_total_len_i > original_total_len:
                     # Where sequence was expanded, fill new positions with mask_id
-                    new_total_len_i = prompt_length + new_gen_lengths[i].item()
                     new_x_tensor[i, original_total_len:new_total_len_i] = mask_token_id
             # Update
             x = new_x_tensor

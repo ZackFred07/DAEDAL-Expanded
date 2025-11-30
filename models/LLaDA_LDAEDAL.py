@@ -124,14 +124,13 @@ def generate(
             max_eos = eos_confidence_threshold + 0.05
 
             # Decide which sequence need mroe space
-            # sequences_to_expand = (batch_eos_confidences < eos_confidence_threshold) & (gen_lengths < max_gen_length)
             sequences_to_increase = min_eos >= batch_eos_confidences
             sequences_to_decrease = max_eos <= batch_eos_confidences
-            sequences_to_search = sequences_to_increase or sequences_to_decrease
+            sequences_to_search = sequences_to_increase | sequences_to_decrease
             if (floor_gen_lengths == ceiling_gen_lengths).any():
                 print("floor & ceiling equaled")
             sequences_to_search = (
-                ~(floor_gen_lengths == ceiling_gen_lengths) and sequences_to_search
+                ~(floor_gen_lengths == ceiling_gen_lengths) & sequences_to_search
             )
 
             if not sequences_to_search.any():
