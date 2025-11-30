@@ -1,5 +1,5 @@
 task: mmlu
-dataset_path: cais/mmlu
+dataset_path: tinyBenchmarks/tinyMMLU
 dataset_name: all
 output_type: generate_until
 test_split: test
