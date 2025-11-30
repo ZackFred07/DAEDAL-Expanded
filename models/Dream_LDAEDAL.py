@@ -155,6 +155,7 @@ def generate(
         return torch.tensor(batch_eos_confidences, device=logits.device)
 
     with torch.autocast(device_type="cuda"):
+        count = 0
         assert eos_token_id is not None
         assert prompt is not None
         batch_size = prompt.shape[0]
@@ -201,7 +202,7 @@ def generate(
         if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
             print("[Stage-1] Initial Length Adjustment")
         while True:
-
+            count += 1
             total_lengths = prompt_length + gen_lengths
             max_len_pre = x.shape[1]
             # Build an attention mask up to total lengths
@@ -222,7 +223,7 @@ def generate(
                 ~(floor_gen_lengths >= ceiling_gen_lengths) & sequences_to_search
             )
 
-            if not sequences_to_search.any():
+            if not sequences_to_search.any() or count > 20:
                 # No sequence needs further searching
                 if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
                     print(f"All sequences' EOS confidence reach the threshold {eos_confidence_threshold} or max length.")
