@@ -1081,7 +1081,7 @@ class Dream_LDAEDAL(TemplateLM):
                 prompt=context_enc,
                 tokenizer=self.tokenizer,
                 attention_mask=attn_masks,
-                initial_gen_length=gen_kwargs.get("initial_gen_length", 64),
+                min_gen_length=gen_kwargs.get("initial_gen_length", 64),
                 max_gen_length=gen_kwargs.get("max_gen_length", 2048),
                 temperature=gen_kwargs.get("temperature", 0.0),
                 high_conf_threshold=gen_kwargs.get("high_conf_threshold", 0.90),
