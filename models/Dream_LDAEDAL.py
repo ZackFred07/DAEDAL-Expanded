@@ -168,7 +168,7 @@ def generate(
             (batch_size,), max_gen_length, dtype=torch.long, device=device
         )
         min_eos = eos_confidence_threshold
-        max_eos = eos_confidence_threshold + 0.05
+        max_eos = eos_confidence_threshold + 0.1
         gen_lengths = torch.full((batch_size,), initial_gen_length, dtype=torch.long, device=device)
         prompt_length = input_ids_length = input_ids.shape[-1]
         x = torch.full(
@@ -219,7 +219,7 @@ def generate(
             if (floor_gen_lengths == ceiling_gen_lengths).any():
                 print("floor & ceiling equaled")
             sequences_to_search = (
-                ~(floor_gen_lengths == ceiling_gen_lengths) & sequences_to_search
+                ~(floor_gen_lengths >= ceiling_gen_lengths) & sequences_to_search
             )
 
             if not sequences_to_search.any():
@@ -234,10 +234,10 @@ def generate(
             new_gen_lengths = gen_lengths.clone()
             floor_gen_lengths[sequences_to_increase] = new_gen_lengths[
                 sequences_to_increase
-            ]
+            ] + 1
             ceiling_gen_lengths[sequences_to_decrease] = new_gen_lengths[
                 sequences_to_decrease
-            ]
+            ] - 1
 
             new_gen_lengths[sequences_to_search] = floor_gen_lengths[
                 sequences_to_search

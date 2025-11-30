@@ -121,7 +121,7 @@ def generate(
             batch_eos_confidences = _calculate_eos_confidence(logits_pre, total_lengths, prompt_length, eos_check_tokens)
 
             min_eos = eos_confidence_threshold
-            max_eos = eos_confidence_threshold + 0.05
+            max_eos = eos_confidence_threshold + 0.1
 
             # Decide which sequence need mroe space
             sequences_to_increase = min_eos >= batch_eos_confidences
@@ -130,7 +130,7 @@ def generate(
             if (floor_gen_lengths == ceiling_gen_lengths).any():
                 print("floor & ceiling equaled")
             sequences_to_search = (
-                ~(floor_gen_lengths == ceiling_gen_lengths) & sequences_to_search
+                ~(floor_gen_lengths >= ceiling_gen_lengths) & sequences_to_search
             )
 
             if not sequences_to_search.any():
@@ -143,8 +143,8 @@ def generate(
 
             # Binear Search
             new_gen_lengths = gen_lengths.clone()
-            floor_gen_lengths[sequences_to_increase] = new_gen_lengths[sequences_to_increase]
-            ceiling_gen_lengths[sequences_to_decrease] = new_gen_lengths[sequences_to_decrease]
+            floor_gen_lengths[sequences_to_increase] = new_gen_lengths[sequences_to_increase] + 1
+            ceiling_gen_lengths[sequences_to_decrease] = new_gen_lengths[sequences_to_decrease] - 1
 
             new_gen_lengths[sequences_to_search] = floor_gen_lengths[
                 sequences_to_search
