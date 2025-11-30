@@ -6,8 +6,9 @@ BASE_OUTPUT_PATH="./results/baseline_1p5"
 MODEL_PATH="./ckpts/LLaDA-1.5"
 
 
-TASKS=("gsm8k" "math500" "svamp")
-LENGTHS=(32 64 128 256 512 1024 2048)
+TASKS=("gsm8k" "math500" "svamp" "mmlu")
+LENGTHS=(32 64 128 256 512 1024)
+
 for task in "${TASKS[@]}"; do
     for length in "${LENGTHS[@]}"; do
         echo "======================================================"
